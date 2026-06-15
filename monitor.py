@@ -2,22 +2,26 @@
 LEVEL fare monitor — BCN<->SCL
 
 Por cada corrida:
-  - Escanea el calendario de precios (ambas direcciones) en un rango amplio.
-  - Para cada VENTANA de viaje: busca el dia mas barato de ida y de vuelta,
-    valida el combo real en el buscador (total verdadero + asientos) y avisa
-    si el TOTAL ida+vuelta baja del presupuesto de esa ventana.
-  - ADEMAS: avisa si CUALQUIER tramo suelto baja de PER_LEG_ALERT en
-    cualquier fecha del rango (util para mover planes si algo sale regalado).
-  - Escribe un status con TODOS los precios por tramo (visibilidad total) en
-    el Job Summary de Actions y en STATUS.md.
+  - Escanea el calendario de precios (ambas direcciones) en los proximos
+    GLOBAL_MONTHS meses (incluido el actual; el rango se mueve solo).
+  - Por cada VENTANA de viaje: busca el dia mas barato de ida y vuelta y
+    VALIDA el combo real en el buscador (precio verdadero + asientos).
+    Solo alerta con precio validado; si el buscador no responde, lo marca
+    como no confiable y NO manda correo (evita falsos positivos por lag).
+  - Avisa si cualquier tramo suelto <= PER_LEG_ALERT en cualquier fecha.
+  - Reintenta ante bloqueos de Akamai. Si la corrida sale poco confiable
+    (muchos bloqueos), suprime correos y lo deja anotado en el status.
+  - Escribe status con todos los precios por tramo (Job Summary + STATUS.md).
 
-El correo es OPCIONAL (secrets de Gmail). Sin ellos, solo genera el status.
+Correo OPCIONAL (secrets de Gmail). Sin ellos, solo genera el status.
 """
 
 import json
 import os
+import random
 import smtplib
 import sys
+import time
 from datetime import date, datetime, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -44,10 +48,12 @@ WINDOWS = [
 
 # --- Escaneo global: cualquier tramo barato, cualquier fecha ---
 PER_LEG_ALERT = 99      # avisa si un tramo (un sentido) <= 99 EUR
-PROMO_LEG = 70          # <= 70 EUR => promo 9EUR, alerta destacada
-GLOBAL_MONTHS = 10      # escaneo = proximos N meses INCLUYENDO el actual.
-                        # Level publica ~10 meses; el rango se mueve solo
-                        # en cada corrida (no hay que editar fechas nunca).
+PROMO_LEG = 70          # <= 70 EUR => promo, alerta destacada
+GLOBAL_MONTHS = 10      # proximos N meses incluyendo el actual (se mueve solo)
+
+# --- Anti-bloqueo / confiabilidad ---
+RETRIES = 3             # intentos por consulta ante bloqueo Akamai
+RELIABLE_MAX_BLOCK = 0.34   # si se bloquea > 34% de las consultas, no alerta
 
 # ----------------------------------------------------------------------
 
@@ -56,14 +62,24 @@ FLIGHTS_URL = "https://www.flylevel.com/nwe/api/flights/"
 STATE_FILE = Path("state.json")
 STATUS_FILE = Path("STATUS.md")
 
-HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/137.0.0.0 Safari/537.36"),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "es-ES,es;q=0.9",
-    "Referer": "https://www.flylevel.com/Flight/Select/",
-}
+UAS = [
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+     "(KHTML, like Gecko) Version/17.4 Safari/605.1.15"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+     "Gecko/20100101 Firefox/125.0"),
+]
+
+
+def base_headers():
+    return {
+        "User-Agent": random.choice(UAS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "es-ES,es;q=0.9",
+        "Referer": "https://www.flylevel.com/Flight/Select/",
+    }
+
 
 # ============================ HELPERS =================================
 
@@ -78,7 +94,6 @@ def month_list(ym_from, ym_to):
 
 
 def next_months(start_ym, n):
-    """n meses (m, y) empezando en start_ym=(anio, mes), incluido."""
     y, m = start_ym
     out = []
     for _ in range(n):
@@ -92,28 +107,51 @@ def months_spanning(d1, d2):
     return month_list((a.year, a.month), (b.year, b.month))
 
 
+def looks_blocked(text):
+    t = (text or "")[:400].lower()
+    return "<!doctype html" in t or "<html" in t
+
+
+def get_with_retry(session, url, params, label):
+    """GET con reintentos ante bloqueo Akamai. Devuelve dict JSON o None."""
+    for attempt in range(1, RETRIES + 1):
+        try:
+            r = session.get(url, params=params, headers=base_headers(),
+                            timeout=30)
+        except requests.RequestException as exc:
+            print(f"[WARN] red {label} intento {attempt}/{RETRIES}: {exc}")
+            time.sleep(2 * attempt + random.uniform(0, 1))
+            continue
+        if r.status_code == 200 and not looks_blocked(r.text):
+            try:
+                return r.json()
+            except ValueError:
+                print(f"[WARN] no-JSON {label} intento {attempt}/{RETRIES}")
+        elif looks_blocked(r.text):
+            print(f"[WARN] bloqueo Akamai {label} "
+                  f"intento {attempt}/{RETRIES}")
+        else:
+            print(f"[WARN] HTTP {r.status_code} {label} "
+                  f"intento {attempt}/{RETRIES}")
+        time.sleep(2 * attempt + random.uniform(0, 1.5))
+    return None
+
+
 def fetch_calendar(session, origin, dest, month, year):
     params = {"triptype": "RT", "origin": origin, "destination": dest,
               "month": f"{month:02d}", "year": str(year),
               "currencyCode": "EUR", "originType": "flights"}
-    try:
-        r = session.get(CAL_URL, params=params, headers=HEADERS, timeout=30)
-    except requests.RequestException as exc:
-        print(f"[WARN] red cal {origin}->{dest} {month}/{year}: {exc}")
-        return None
-    if r.status_code != 200:
-        print(f"[WARN] HTTP {r.status_code} cal {origin}->{dest} "
-              f"{month}/{year} (posible Akamai)")
+    data = get_with_retry(session, CAL_URL, params,
+                          f"cal {origin}->{dest} {month}/{year}")
+    if not data:
         return None
     try:
-        return r.json()["data"]["dayPrices"]
-    except (ValueError, KeyError):
-        print(f"[WARN] no-JSON cal {origin}->{dest}: {r.text[:80].strip()}")
+        return data["data"]["dayPrices"]
+    except (KeyError, TypeError):
         return None
 
 
 def leg_min(fares_economy):
-    """(precio_total_min, asientos_de_esa_tarifa, tags) de una lista de fares."""
     best = None
     for f in fares_economy:
         if f.get("totalPrice") is None:
@@ -122,28 +160,22 @@ def leg_min(fares_economy):
             best = f
     if not best:
         return None
-    return (round(best["totalPrice"], 2),
-            best.get("availability"),
+    return (round(best["totalPrice"], 2), best.get("availability"),
             best.get("tags") or [])
 
 
 def fetch_flights(session, o, d, dd1, dd2):
-    """Combo real ida+vuelta -> dict con totales, asientos y tags, o None."""
     params = {"o1": o, "d1": d, "dd1": dd1, "dd2": dd2,
               "ADT": 1, "CHD": 0, "INL": 0, "r": "true", "mm": "true",
               "forcedCurrency": "EUR", "forcedCulture": "es-ES",
               "newecom": "true", "originType": "flights"}
-    try:
-        r = session.get(FLIGHTS_URL, params=params, headers=HEADERS, timeout=30)
-    except requests.RequestException as exc:
-        print(f"[WARN] red flights {o}->{d} {dd1}/{dd2}: {exc}")
-        return None
-    if r.status_code != 200:
-        print(f"[WARN] HTTP {r.status_code} flights {o}->{d} (posible Akamai)")
+    data = get_with_retry(session, FLIGHTS_URL, params,
+                          f"flights {o}->{d} {dd1}/{dd2}")
+    if not data:
         return None
     try:
-        fi = r.json()["flightsInfo"]
-    except (ValueError, KeyError):
+        fi = data["flightsInfo"]
+    except (KeyError, TypeError):
         return None
 
     def best_of(journeys):
@@ -209,16 +241,14 @@ def main():
 
     s = requests.Session()
     try:
-        s.get("https://www.flylevel.com/", headers=HEADERS, timeout=30)
+        s.get("https://www.flylevel.com/", headers=base_headers(), timeout=30)
     except requests.RequestException:
         pass
 
-    # 1) Calendario: escaneo global = proximos N meses desde el mes actual.
+    # 1) Calendario: proximos N meses + meses de ventanas (por si caen fuera)
     today = datetime.now(timezone.utc).date()
     scan_months = next_months((today.year, today.month), GLOBAL_MONTHS)
     scan_set = set(scan_months)
-    # Aseguramos consultar tambien los meses de las ventanas (por si alguna
-    # cae fuera del rango de escaneo).
     fetch_months = list(scan_months)
     for w in WINDOWS:
         for my in (months_spanning(w["out_from"], w["out_to"])
@@ -226,11 +256,13 @@ def main():
             if my not in scan_set and my not in fetch_months:
                 fetch_months.append(my)
 
-    cal = {}        # (dir, "YYYY-MM-DD") -> {price, tags}
+    cal = {}
     blocked = 0
+    attempts = 0
     for direction, (o, d) in {"BCN->SCL": ("BCN", "SCL"),
                               "SCL->BCN": ("SCL", "BCN")}.items():
         for m, y in fetch_months:
+            attempts += 1
             dp = fetch_calendar(s, o, d, m, y)
             if dp is None:
                 blocked += 1
@@ -239,6 +271,10 @@ def main():
                 if p.get("price"):
                     cal[(direction, p["date"])] = {
                         "price": p["price"], "tags": p.get("tags") or []}
+            time.sleep(random.uniform(0.4, 1.0))   # politeness entre llamadas
+
+    block_ratio = blocked / max(1, attempts)
+    reliable = block_ratio <= RELIABLE_MAX_BLOCK
 
     def dir_days(direction):
         return [{"date": k[1], **v} for k, v in cal.items() if k[0] == direction]
@@ -248,102 +284,117 @@ def main():
     md = [f"## LEVEL monitor — {now}\n",
           f"Ruta BCN↔SCL · escaneo {sm0[1]}-{sm0[0]:02d} a "
           f"{smN[1]}-{smN[0]:02d} ({GLOBAL_MONTHS} meses) · "
-          f"bloqueos: {blocked}\n"]
-    new_alerts = []   # (key, texto)
+          f"bloqueos: {blocked}/{attempts}\n"]
+    if not reliable:
+        md.append(f"> ⚠️ **Corrida poco confiable** ({blocked}/{attempts} "
+                  f"consultas bloqueadas por Level). No se envían correos "
+                  f"esta vez para evitar falsos positivos.\n")
+    new_alerts = []
 
-    # 2) Ventanas: combo real ida+vuelta
+    # 2) Ventanas: SOLO alerta con combo validado por el buscador
     md.append("### Tus ventanas (total ida+vuelta)\n")
     for w in WINDOWS:
         out_c = cheapest_day(dir_days("BCN->SCL"), w["out_from"], w["out_to"])
         in_c = cheapest_day(dir_days("SCL->BCN"), w["ret_from"], w["ret_to"])
         if not out_c or not in_c:
-            md.append(f"**{w['name']}** — sin datos de calendario en el rango\n")
+            md.append(f"**{w['name']}** — sin datos de calendario "
+                      f"(bloqueo o sin vuelos)\n")
             continue
 
         real = fetch_flights(s, "BCN", "SCL", out_c["date"], in_c["date"])
-        if real:
-            total = real["total"]
-            o_pr, i_pr = real["out_price"], real["in_price"]
-            o_se, i_se = real["out_seats"], real["in_seats"]
-            tags = set(real["out_tags"]) | set(real["in_tags"])
-            src = "combo real"
-        else:
-            total = out_c["price"] + in_c["price"]
-            o_pr, i_pr = out_c["price"], in_c["price"]
-            o_se = i_se = None
-            tags = set(out_c["tags"]) | set(in_c["tags"])
-            src = "estimado calendario (buscador no respondio)"
+        link = deep_link(out_c["date"], in_c["date"])
 
+        if not real:
+            # Buscador no validó: mostramos estimado pero NO alertamos
+            est = round(out_c["price"] + in_c["price"], 2)
+            md.append(
+                f"**{w['name']}** ⚠️ — estimado €{est} "
+                f"(buscador no respondió, *no se alerta*)  \n"
+                f"&nbsp;&nbsp;IDA {out_c['date']}: €{out_c['price']} · "
+                f"VUELTA {in_c['date']}: €{in_c['price']}  \n"
+                f"&nbsp;&nbsp;[Buscar]({link})\n")
+            continue
+
+        total = real["total"]
+        o_pr, i_pr = real["out_price"], real["in_price"]
+        o_se, i_se = real["out_seats"], real["in_seats"]
         promo = (o_pr <= PROMO_LEG or i_pr <= PROMO_LEG)
         hit = total < w["max_total"] or promo
         flag = "🔥" if promo else ("✅" if hit else "")
-        link = deep_link(out_c["date"], in_c["date"])
-
         seats = lambda x: f" ({x} asientos)" if x is not None else ""
         md.append(
             f"**{w['name']}** {flag} — total **€{total}** "
-            f"(límite €{w['max_total']}) · _{src}_  \n"
+            f"(límite €{w['max_total']}) · _combo real_  \n"
             f"&nbsp;&nbsp;IDA {out_c['date']}: €{o_pr}{seats(o_se)} · "
             f"VUELTA {in_c['date']}: €{i_pr}{seats(i_se)}  \n"
             f"&nbsp;&nbsp;[Reservar]({link})\n")
 
         if hit:
             key = f"WIN|{w['name']}|{out_c['date']}|{in_c['date']}|{int(total//50)}"
-            if key not in alerted:
-                txt = (f"[{w['name']}] TOTAL €{total} "
-                       f"{'(PROMO 9EUR!)' if promo else ''}\n"
-                       f"  IDA {out_c['date']}: €{o_pr}{seats(o_se)}\n"
-                       f"  VUELTA {in_c['date']}: €{i_pr}{seats(i_se)}\n"
-                       f"  Reservar: {link}")
-                new_alerts.append((key, txt))
+            txt = (f"[{w['name']}] TOTAL €{total} "
+                   f"{'(PROMO!)' if promo else ''}\n"
+                   f"  IDA {out_c['date']}: €{o_pr}{seats(o_se)}\n"
+                   f"  VUELTA {in_c['date']}: €{i_pr}{seats(i_se)}\n"
+                   f"  Reservar: {link}")
+            new_alerts.append((key, txt))
 
-    # 3) Escaneo global: tramos sueltos baratos
+    # 3) Tramos sueltos baratos (del calendario que SÍ respondió)
     md.append("\n### Tramos sueltos baratos (cualquier fecha)\n")
-    cheap_legs = []
+    cheap = []
     for direction in ("BCN->SCL", "SCL->BCN"):
         for d in sorted(dir_days(direction), key=lambda x: x["date"]):
             yy, mm = int(d["date"][:4]), int(d["date"][5:7])
             if (mm, yy) not in scan_set:
-                continue   # solo el rango de 10 meses, no meses extra de ventana
+                continue
             if d["price"] <= PER_LEG_ALERT:
-                cheap_legs.append((direction, d["date"], d["price"], d["tags"]))
-    if cheap_legs:
+                cheap.append((direction, d["date"], d["price"]))
+    if cheap:
         md.append("| Sentido | Fecha | Precio | |")
         md.append("|---|---|---|---|")
-        for direction, dt, pr, tg in cheap_legs:
-            mark = "🔥9€" if pr <= PROMO_LEG else "✅"
+        for direction, dt, pr in cheap:
+            mark = "🔥promo" if pr <= PROMO_LEG else "✅"
             md.append(f"| {direction} | {dt} | €{pr} | {mark} |")
             key = f"LEG|{direction}|{dt}|{int(pr//20)}"
-            if key not in alerted:
-                new_alerts.append(
-                    (key, f"TRAMO SUELTO {direction} {dt}: €{pr} "
-                          f"{'(PROMO 9EUR!)' if pr <= PROMO_LEG else ''}"))
+            new_alerts.append(
+                (key, f"TRAMO SUELTO {direction} {dt}: €{pr} "
+                      f"{'(PROMO!)' if pr <= PROMO_LEG else ''}"))
     else:
-        md.append(f"_ningún tramo ≤ €{PER_LEG_ALERT} en el rango escaneado._\n")
+        md.append(f"_ningún tramo ≤ €{PER_LEG_ALERT} en el rango._\n")
 
-    # 4) Status + correo
-    if new_alerts:
-        md.insert(2, f"> 🔥 **{len(new_alerts)} alerta(s) nueva(s) — ver abajo**\n")
-    md.append(f"\n---\n_correo: {'activo' if email_on() else 'no configurado'}_")
+    # 4) Filtrar a solo alertas NUEVAS
+    fresh = [(k, t) for (k, t) in new_alerts if k not in alerted]
+    if fresh and reliable:
+        md.insert(2, f"> 🔥 **{len(fresh)} alerta(s) nueva(s) — ver abajo**\n")
+
+    md.append(f"\n---\n_correo: {'activo' if email_on() else 'no configurado'} "
+              f"· confiable: {'sí' if reliable else 'no'}_")
     write_status("\n".join(md))
-    print(f"[INFO] {now} | alertas_nuevas={len(new_alerts)} bloqueos={blocked}")
+    print(f"[INFO] {now} | alertas_nuevas={len(fresh)} "
+          f"bloqueos={blocked}/{attempts} confiable={reliable}")
 
-    if new_alerts and email_on():
-        body = "ALERTAS LEVEL\n\n" + "\n\n".join(t for _, t in new_alerts)
+    # 5) Correo SOLO si la corrida es confiable
+    sent = False
+    if fresh and reliable and email_on():
+        body = "ALERTAS LEVEL\n\n" + "\n\n".join(t for _, t in fresh)
         body += ("\n\n---\nOjo: el calendario puede tener lag. Confirma en el "
-                 "buscador y compra al tiro. Los asientos son por bucket de "
-                 "tarifa, no del avion entero.")
-        n = len(new_alerts)
-        send_email(f"LEVEL: {n} alerta(s) de vuelos baratos", body)
+                 "buscador y compra al toque. Asientos = por bucket de tarifa, "
+                 "no del avión entero.")
+        send_email(f"LEVEL: {len(fresh)} alerta(s) de vuelos baratos", body)
+        sent = True
 
-    for key, _ in new_alerts:
-        alerted.add(key)
+    # Solo marcamos como 'ya avisado' lo que de verdad se envió
+    if sent:
+        for k, _ in fresh:
+            alerted.add(k)
+
     state.update({"alerted": sorted(alerted), "last_run": now,
-                  "last_alerts": len(new_alerts), "last_blocked": blocked})
+                  "last_alerts": len(fresh), "last_blocked": blocked,
+                  "last_attempts": attempts, "reliable": reliable})
     STATE_FILE.write_text(json.dumps(state, indent=1))
 
-    if blocked >= len(fetch_months) and blocked > 0:
-        print("[ERROR] todo bloqueado — ver Plan B (correr local)")
+    # Rojo SOLO si se bloqueó TODO (señal de revisar Plan B)
+    if attempts and blocked == attempts:
+        print("[ERROR] todas las consultas bloqueadas — ver Plan B (local)")
         sys.exit(1)
 
 
