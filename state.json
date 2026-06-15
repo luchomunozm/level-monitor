@@ -1,0 +1,9 @@
+{
+ "alerted": [
+  "IDA BCN->SCL|2027-01-27|319",
+  "VUELTA SCL->BCN|2027-02-01|363"
+ ],
+ "last_run": "2026-06-15T20:20:34.699373Z",
+ "last_findings": 2,
+ "last_blocked": 0
+}
