@@ -1,0 +1,43 @@
+name: LEVEL 9eur monitor
+
+on:
+  schedule:
+    # Cada 5 minutos (minimo de GitHub; en la practica puede demorar mas)
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # permite ejecutarlo a mano con un boton
+
+permissions:
+  contents: write   # para guardar state.json y no repetir alertas
+
+concurrency:
+  group: level-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Run monitor
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python monitor.py
+
+      - name: Persist state (no repetir alertas)
+        if: always()
+        run: |
+          git config user.name "level-monitor-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json || true
+          git diff --cached --quiet || git commit -m "state update [skip ci]"
+          git push || true
