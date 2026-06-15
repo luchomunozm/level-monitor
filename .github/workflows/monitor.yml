@@ -5,6 +5,8 @@ on:
     # Cada 5 minutos (minimo de GitHub; en la practica puede demorar mas)
     - cron: "*/5 * * * *"
   workflow_dispatch: {}   # permite ejecutarlo a mano con un boton
+   repository_dispatch:
+    types: [run-monitor]
 
 permissions:
   contents: write   # para guardar state.json y no repetir alertas
