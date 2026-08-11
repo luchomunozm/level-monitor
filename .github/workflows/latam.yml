@@ -1,0 +1,41 @@
+name: LATAM monitor
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [run-latam]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: latam-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run LATAM monitor
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python latam_monitor.py
+      - name: Commit state
+        if: always()
+        run: |
+          git config user.name "latam-monitor-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase || true
+          git add LATAM_STATUS.md latam_state.json || true
+          git diff --cached --quiet || git commit -m "latam status [skip ci]"
+          git push || true
