@@ -6,8 +6,8 @@
  ],
  "last_run": "2026-09-02 22:45 UTC",
  "last_findings": 2,
- "last_blocked": 20,
+ "last_blocked": 0,
  "last_alerts": 0,
  "last_attempts": 20,
- "reliable": false
+ "reliable": true
 }
