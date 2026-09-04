@@ -2,7 +2,7 @@ name: LEVEL 9eur monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/59 * * * *"
   workflow_dispatch: {}
   repository_dispatch:
     types: [run-monitor]
